@@ -22,7 +22,16 @@ import static org.junit.Assert.assertEquals;
 
 import org.junit.Test;
 
+import java.util.stream.Stream;
+
 public class LogsUtilTest {
+    @Test
+    public void hej() {
+        Stream.of(1,2,3,4,5)
+              .map(i -> i*2)
+              .onClose(() -> System.err.println("Closed!"))
+              .toList().forEach(i -> System.out.println("Item: " + i));
+    }
 
     @Test
     public void shouldRedactPasswords() {

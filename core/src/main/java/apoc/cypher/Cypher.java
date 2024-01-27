@@ -38,9 +38,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Spliterator;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+
 import org.neo4j.graphdb.GraphDatabaseService;
 import org.neo4j.graphdb.QueryStatistics;
 import org.neo4j.graphdb.Result;
@@ -117,6 +121,18 @@ public class Cypher {
             return Stream.empty();
         } catch (Exception e) {
             throw new RuntimeException("Failed to execute inner statement: " + cypher, e);
+        }
+    }
+
+    private Stream<Cypher.RowResult> streamInNewTx(String cypher, Map<String, Object> params, boolean stats) {
+        final var tx = db.beginTx();
+        try {
+
+            final var spliterator = new ResultSpliterator(tx.execute( cypher, params), stats);
+            return StreamSupport.stream(spliterator, false).onClose(spliterator::close).onClose(tx::commit);
+        } catch (Throwable t) {
+            tx.close();
+            throw t;
         }
     }
 
@@ -283,7 +299,9 @@ class BufferingRowResultTransformer
         result.accept(this);
         if (statistics) {
             final var stats = toMap(result.getQueryStatistics(), System.currentTimeMillis() - start, rowCount);
-            return Stream.concat(rows.stream(), Stream.of(new Cypher.RowResult(-1, stats)));
+            return Stream.concat(rows.stream(), Stream.of(new Cypher.RowResult(-1, stats))).onClose(() -> {
+                System.out.println("We're closing now!");
+            });
         } else {
             return rows.stream();
         }
@@ -297,5 +315,52 @@ class BufferingRowResultTransformer
         //noinspection unchecked
         rows.add(new Cypher.RowResult(rowCount++, Map.ofEntries(entries)));
         return true;
+    }
+}
+
+/** Spliterator for traversing query results and committing transaction when complete, or closed.  */
+class ResultSpliterator implements Spliterator<Cypher.RowResult>, AutoCloseable {
+    private final Result result;
+    private final long start;
+    private boolean statistics;
+    private int rowCount;
+
+    ResultSpliterator(Result result, boolean statistics) {
+        this.result = result;
+        this.start = System.currentTimeMillis();
+        this.statistics = statistics;
+    }
+
+    @Override
+    public boolean tryAdvance(Consumer<? super Cypher.RowResult> action) {
+        if (result.hasNext()) {
+            action.accept(new Cypher.RowResult(rowCount++, result.next()));
+            return true;
+        } else if (statistics) {
+            final var stats = toMap(result.getQueryStatistics(), System.currentTimeMillis() - start, rowCount);
+            statistics = false;
+            action.accept(new Cypher.RowResult(-1, stats));
+            return true;
+        }
+        result.close();
+        return false;
+    }
+
+    @Override
+    public Spliterator<Cypher.RowResult> trySplit() { return null; }
+
+    @Override
+    public long estimateSize() {
+        return result.hasNext() ? Long.MAX_VALUE : 1;
+    }
+
+    @Override
+    public int characteristics() {
+        return Spliterator.ORDERED;
+    }
+
+    @Override
+    public void close() {
+        result.close();
     }
 }
