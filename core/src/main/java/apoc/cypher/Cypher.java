@@ -22,7 +22,6 @@ import static apoc.cypher.Cypher.toMap;
 import static apoc.cypher.CypherUtils.runCypherQuery;
 import static apoc.cypher.CypherUtils.withParamMapping;
 import static apoc.util.MapUtil.map;
-import static java.util.Map.entry;
 import static org.neo4j.procedure.Mode.READ;
 import static org.neo4j.procedure.Mode.SCHEMA;
 import static org.neo4j.procedure.Mode.WRITE;
@@ -32,7 +31,6 @@ import apoc.result.MapResult;
 import apoc.util.Util;
 import apoc.util.collection.Iterators;
 import java.io.StringReader;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -44,11 +42,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
-
 import org.neo4j.graphdb.GraphDatabaseService;
 import org.neo4j.graphdb.QueryStatistics;
 import org.neo4j.graphdb.Result;
-import org.neo4j.graphdb.ResultTransformer;
 import org.neo4j.graphdb.Transaction;
 import org.neo4j.graphdb.security.AuthorizationViolationException;
 import org.neo4j.procedure.Context;
@@ -95,19 +91,19 @@ public class Cypher {
         return Iterators.stream(new Scanner(new StringReader(cypher)).useDelimiter(";\r?\n"))
                 .map(Cypher::removeShellControlCommands)
                 .filter(s -> !s.isBlank())
-                .flatMap(s -> rowResultsInNewTx(s, params, addStatistics));
+                .flatMap(s -> streamInNewTx(s, params, addStatistics));
     }
 
-    private Stream<RowResult> rowResultsInNewTx(String cypher, Map<String, Object> params, boolean addStatistics) {
-        terminationGuard.check();
+    private Stream<Cypher.RowResult> streamInNewTx(String cypher, Map<String, Object> params, boolean stats) {
+        final var innerTx = db.beginTx();
         try {
             // Hello fellow wanderer,
             // At this point you may have questions like;
             // - "Why do we execute this statement in a new transaction?"
-            // - "Why do we buffer the results?"
             // My guess is as good as yours. This is the way of the apoc. Safe travels.
-            return db.executeTransactionally(cypher, params, new BufferingRowResultTransformer(addStatistics));
-        } catch (AuthorizationViolationException e) {
+            final var results = new RunManyResultSpliterator(innerTx.execute(cypher, params), stats);
+            return StreamSupport.stream(results, false).onClose(results::close).onClose(innerTx::commit);
+        } catch (AuthorizationViolationException accessModeException) {
             // We meet again, few people make it this far into this world!
             // I hope you're not still seeking answers, there are few to give.
             // It has been written, in some long forgotten commits,
@@ -115,21 +111,11 @@ public class Cypher {
             // were brave and used a regex based cypher parser to avoid
             // trying to execute schema changing statements all together.
             // We don't have that courage, and try to forget about it
-            // after the fact instead. One can only hope that by keeping
-            // this tradition alive, in some form, we make
-            // some poor souls happier.
+            // after the fact instead.
+            // One can only hope that by keeping this tradition alive,
+            // in some form, we make some poor souls happier.
+            tx.close();
             return Stream.empty();
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to execute inner statement: " + cypher, e);
-        }
-    }
-
-    private Stream<Cypher.RowResult> streamInNewTx(String cypher, Map<String, Object> params, boolean stats) {
-        final var tx = db.beginTx();
-        try {
-
-            final var spliterator = new ResultSpliterator(tx.execute( cypher, params), stats);
-            return StreamSupport.stream(spliterator, false).onClose(spliterator::close).onClose(tx::commit);
         } catch (Throwable t) {
             tx.close();
             throw t;
@@ -280,52 +266,14 @@ public class Cypher {
     }
 }
 
-class BufferingRowResultTransformer
-        implements ResultTransformer<Stream<Cypher.RowResult>>, Result.ResultVisitor<RuntimeException> {
-    private final boolean statistics;
-    private String[] columns;
-    private List<Cypher.RowResult> rows;
-    private long rowCount = 0;
-
-    BufferingRowResultTransformer(boolean statistics) {
-        this.statistics = statistics;
-    }
-
-    @Override
-    public Stream<Cypher.RowResult> apply(Result result) {
-        final var start = System.currentTimeMillis();
-        columns = result.columns().toArray(new String[0]);
-        rows = new ArrayList<>();
-        result.accept(this);
-        if (statistics) {
-            final var stats = toMap(result.getQueryStatistics(), System.currentTimeMillis() - start, rowCount);
-            return Stream.concat(rows.stream(), Stream.of(new Cypher.RowResult(-1, stats))).onClose(() -> {
-                System.out.println("We're closing now!");
-            });
-        } else {
-            return rows.stream();
-        }
-    }
-
-    @Override
-    public boolean visit(Result.ResultRow row) throws RuntimeException {
-        final var size = columns.length;
-        final var entries = new Map.Entry[size];
-        for (int i = 0; i < size; ++i) entries[i] = entry(columns[i], row.get(columns[i]));
-        //noinspection unchecked
-        rows.add(new Cypher.RowResult(rowCount++, Map.ofEntries(entries)));
-        return true;
-    }
-}
-
 /** Spliterator for traversing query results and committing transaction when complete, or closed.  */
-class ResultSpliterator implements Spliterator<Cypher.RowResult>, AutoCloseable {
+class RunManyResultSpliterator implements Spliterator<Cypher.RowResult>, AutoCloseable {
     private final Result result;
     private final long start;
     private boolean statistics;
     private int rowCount;
 
-    ResultSpliterator(Result result, boolean statistics) {
+    RunManyResultSpliterator(Result result, boolean statistics) {
         this.result = result;
         this.start = System.currentTimeMillis();
         this.statistics = statistics;
@@ -342,12 +290,14 @@ class ResultSpliterator implements Spliterator<Cypher.RowResult>, AutoCloseable 
             action.accept(new Cypher.RowResult(-1, stats));
             return true;
         }
-        result.close();
+        close();
         return false;
     }
 
     @Override
-    public Spliterator<Cypher.RowResult> trySplit() { return null; }
+    public Spliterator<Cypher.RowResult> trySplit() {
+        return null;
+    }
 
     @Override
     public long estimateSize() {
