@@ -32,6 +32,7 @@ import static apoc.util.Util.map;
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonMap;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -53,7 +54,6 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicLong;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -465,14 +465,14 @@ public class CypherTest {
     }
 
     @Test
-    public void runManyCloseTransactions() {
+    public void runManyCloseTransactionsWithRandomFailures() {
         final var rnd = new Random();
         final var seed = rnd.nextLong();
         rnd.setSeed(seed);
 
         final var statements = new ArrayList<String>();
 
-        // First add some statements that will never fail
+        // Add some statements that will never fail
         final var successStatements = 1024;
         int row = 0;
         for (int i = 0; i < successStatements; ++i) {
@@ -481,7 +481,7 @@ public class CypherTest {
             row += size + 1;
         }
 
-        // Add one failing statement at random position
+        // Add one failing query at random position
         final var failureIndex = rnd.nextInt(statements.size());
         statements.set(
                 failureIndex,
@@ -489,17 +489,22 @@ public class CypherTest {
 
         // The outer query also fails at a random row
         final var failureRow = rnd.nextInt(row);
-        final var q = "CALL apoc.cypher.runMany($q, {}) return row, result, 1 / (result.x - $x)";
-        final var innerQ = String.join(";\n", statements);
 
-        try (final var tx = db.beginTx()) {
-            final var seenRows = new AtomicLong(0);
-            try (final var result = tx.execute(q, Map.of("q", innerQ, "x", failureRow))) {
-                result.accept(r -> seenRows.incrementAndGet() >= 0);
-            }
-        } catch (Throwable t) {
-            // Ignore
-        }
+        assertThatThrownBy(() -> {
+                    try (final var tx = db.beginTx()) {
+                        final var q =
+                                """
+                    call apoc.cypher.runMany($q, {}) yield row, result
+                    return row, result, 1 / (result.x - $x) as boom
+                    """;
+                        final var innerQ = String.join(";\n", statements);
+                        try (final var result = tx.execute(q, Map.of("q", innerQ, "x", failureRow))) {
+                            result.accept(r -> true);
+                        }
+                    }
+                })
+                .hasRootCauseInstanceOf(org.neo4j.exceptions.ArithmeticException.class);
+
         assertNoOpenTransactionsEventually();
     }
 
@@ -512,7 +517,8 @@ public class CypherTest {
     }
 
     private void assertNoOpenTransactions() {
-        final var txs = db.executeTransactionally("show transactions", Map.of(), r -> r.stream().toList());
+        final var txs = db.executeTransactionally(
+                "show transactions", Map.of(), r -> r.stream().toList());
         assertThat(txs).satisfiesExactly(row -> assertEquals("show transactions", row.get("currentQuery")));
     }
 }
